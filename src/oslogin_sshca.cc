@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <oslogin_sshca.h>
-#include <oslogin_utils.h>
-#include <openbsd.h>
+#include <cstdlib>
+#include <cstring>
+
+#include "include/oslogin_sshca.h"
+#include "include/oslogin_utils.h"
+#include "openbsd-compat/base64.h"
 
 using oslogin_utils::SysLogErr;
 
@@ -240,19 +243,22 @@ out:
 }
 
 static size_t ExtractFingerPrint(const char *extension, char **out) {
-  int i = 0;
-
-  if (extension == NULL || strstr(extension, "fingerprint@google.com=") == NULL) {
+  const char *fingerprint_key = "fingerprint@google.com=";
+  
+  if (extension == NULL) {
     return 0;
   }
 
-  for (i = 0; extension[i] != '\0'; i++) {
-    if (extension[i] == '=') {
-      *out = strdup(extension + i + 1);
-    }
+  const char *fingerprint_start = strstr(extension, fingerprint_key); 
+  if (fingerprint_start == NULL) {
+    return 0;
   }
 
-  return i;
+  fingerprint_start += strlen(fingerprint_key);
+  
+  *out = strdup(fingerprint_start);
+ 
+  return strlen(*out);
 }
 
 static int GetByoidFingerPrint(const char *blob, char **fingerprint) {

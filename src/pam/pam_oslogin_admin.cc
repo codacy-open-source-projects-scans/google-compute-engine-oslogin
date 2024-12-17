@@ -13,9 +13,14 @@
 // limitations under the License.
 
 #include <security/pam_modules.h>
+#include <security/_pam_types.h>
 
-#include <compat.h>
-#include <oslogin_utils.h>
+#include <cstddef>
+#include <cstdio>
+#include <string>
+
+#include "include/compat.h"
+#include "include/oslogin_utils.h"
 
 using std::string;
 
@@ -40,7 +45,7 @@ pam_sm_acct_mgmt(pam_handle_t* pamh, int flags, int argc, const char** argv) {
     return PAM_PERM_DENIED;
   }
 
-  opts = { 0 };
+  opts = {};
   opts.admin_policy_required = true;
 
   if (!AuthorizeUser(user_name, opts, &user_response)) {

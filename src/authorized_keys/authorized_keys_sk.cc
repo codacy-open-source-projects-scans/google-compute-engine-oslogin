@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <vector>
 
 #include <signal.h>
 
-#include <oslogin_utils.h>
+#include "include/oslogin_utils.h"
 
 using std::cout;
 using std::endl;
@@ -54,7 +56,7 @@ int main(int argc, char* argv[]) {
     goto fail;
   }
 
-  sig = { 0 };
+  sig = {};
   sig.sa_handler = signal_handler;
   sigemptyset(&sig.sa_mask);
 
@@ -66,7 +68,7 @@ int main(int argc, char* argv[]) {
   user_name = argv[1];
   is_sa = (strncmp(user_name, "sa_", 3) == 0);
 
-  opts = { 0 };
+  opts = {};
   opts.security_key = true;
 
   if (AuthorizeUser(user_name, opts, &user_response)) {

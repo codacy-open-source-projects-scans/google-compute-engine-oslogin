@@ -13,14 +13,21 @@
 // limitations under the License.
 
 #define PAM_SM_ACCOUNT
+
+#include <security/pam_ext.h>
 #include <security/pam_modules.h>
+#include <security/_pam_types.h>
 #include <syslog.h>
 
-#include <sstream>
+#include <cstddef>
+#include <cstdio>
 #include <map>
+#include <sstream>
+#include <string>
+#include <vector>
 
-#include <compat.h>
-#include <oslogin_utils.h>
+#include "include/compat.h"
+#include "include/oslogin_utils.h"
 
 using oslogin_utils::AuthOptions;
 using oslogin_utils::ContinueSession;
@@ -50,7 +57,7 @@ pam_sm_acct_mgmt(pam_handle_t* pamh, int flags, int argc, const char** argv) {
     return PAM_PERM_DENIED;
   }
 
-  opts = { 0 };
+  opts = {};
 
   if (!AuthorizeUser(user_name, opts, &user_response)) {
     return PAM_PERM_DENIED;
@@ -111,6 +118,7 @@ pam_sm_authenticate(pam_handle_t* pamh, int flags, int argc,
   }
 
   if (status == "NO_AVAILABLE_CHALLENGES") {
+    PAM_SYSLOG(pamh, LOG_ERR, "User has no two-factor methods enabled.");
     return PAM_PERM_DENIED; // User is not two-factor enabled, deny login.
   }
 

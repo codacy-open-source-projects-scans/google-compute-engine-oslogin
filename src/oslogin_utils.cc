@@ -14,6 +14,7 @@
 
 // Requires libcurl4-openssl-dev, libjson-c5, and libjson-c-dev
 #include <curl/curl.h>
+#include <curl/easy.h>
 #include <errno.h>
 #include <grp.h>
 #include <json.h>
@@ -24,13 +25,14 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include <cstdint>
 #include <cstring>
 #include <cstdarg>
 #include <iostream>
 #include <sstream>
 #include <fstream>
-
-#include <json_object.h>
+#include <string>
+#include <vector>
 
 #if defined(__clang__) || __GNUC__ > 4 || \
     (__GNUC__ == 4 &&                     \
@@ -42,8 +44,8 @@
 #define Regex boost
 #endif
 
-#include <compat.h>
-#include <oslogin_utils.h>
+#include "include/compat.h"
+#include "include/oslogin_utils.h"
 
 using std::string;
 
@@ -204,7 +206,7 @@ json_object* ParseJsonRoot(const string& json) {
     enum json_tokener_error jerr = json_tokener_get_error(tok);
     string error_message = json_tokener_error_desc(jerr);
     SysLogErr("Failed to parse root JSON element: \"%s\", from input \"%s\"",
-              error_message, json);
+              error_message.c_str(), json.c_str());
   }
 
   json_tokener_free(tok);
@@ -607,7 +609,10 @@ bool ParseJsonToGroups(const string& json, std::vector<Group>* result) {
     }
 
     Group g;
-    g.gid = json_object_get_int64(gid);
+    // We use json_object_get_int64 because GIDs are unsigned and may use all
+    // 32 bits, but there is no json_object_get_uint32.
+    // Because the GID should never exceed 32 bits, truncation is safe.
+    g.gid = (uint32_t)json_object_get_int64(gid);
 
     // get_int64 will confusingly return 0 if the string can't be converted to
     // an integer. We can't rely on type check as it may be a string in the API.
@@ -1120,7 +1125,7 @@ bool GetGroupByName(string name, struct group* result, BufferManager* buf, int* 
   return true;
 }
 
-bool GetGroupByGID(int gid, struct group* result, BufferManager* buf, int* errnop) {
+bool GetGroupByGID(uint32_t gid, struct group* result, BufferManager* buf, int* errnop) {
   std::stringstream url;
   std::vector<Group> groups;
 
