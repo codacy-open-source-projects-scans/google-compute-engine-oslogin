@@ -585,7 +585,7 @@ bool ParseJsonToGroups(const string& json, std::vector<Group>* result) {
   json_object* groups;
   json_type groupType;
   if (!json_object_object_get_ex(root, "posixGroups", &groups)) {
-    SysLogErr("failed to parse POSIX groups from \"%s\"", json);
+    SysLogErr("failed to parse POSIX groups from \"%s\"", json.c_str());
     goto cleanup;
   }
   groupType = json_object_get_type(groups);
@@ -1304,7 +1304,8 @@ static bool ApplyPolicy(const char *user_name, string email, const char *policy,
 
   if (http_code != 200) {
     SysLogErr("Failed to validate that OS Login user %s has %s permission; "
-              "got HTTP response code: %lu", user_name, policy, http_code);
+              "got HTTP response code: %lu; got HTTP response body: %s",
+              user_name, policy, http_code, response);
     return false;
   }
 
@@ -1357,7 +1358,7 @@ static bool CreateGoogleSudoersFile(string sudoers_filename, const char *user_na
   return true;
 }
 
-bool AuthorizeUser(const char *user_name, struct AuthOptions opts, string *user_response) {
+bool AuthorizeUser(const char *user_name, struct AuthOptions opts, string *user_response, bool cloud_run) {
   bool users_file_exists, sudoers_exists;
   string email, users_filename, sudoers_filename;
 
@@ -1374,6 +1375,15 @@ bool AuthorizeUser(const char *user_name, struct AuthOptions opts, string *user_
 
   if (!ParseJsonToEmail(*user_response, &email) || email.empty()) {
     return false;
+  }
+
+  // Only check adminLogin for cloud run. Skip file creations.
+  if (cloud_run) {
+    bool result = ApplyPolicy(user_name, email, "adminLogin", opts);
+    if (!result) {
+      SysLogErr("Could not grant root access to organization user: %s.", user_name);
+    }
+    return result;
   }
 
   users_filename = kUsersDir;
