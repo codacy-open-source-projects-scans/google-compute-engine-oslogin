@@ -1322,15 +1322,20 @@ static bool FileExists(const char *file_path) {
   return !stat(file_path, &buff);
 }
 
-static bool CreateGoogleUserFile(string users_filename) {
+static bool CreateGoogleUserFile(string users_filedir, string user_name) {
   std::ofstream users_file;
 
+  string users_filename = (users_filedir + user_name);
   users_file.open(users_filename.c_str());
 
   if (!users_file.is_open()) {
     // If we can't open the file (meaning we can't create it) we should report failure.
     return false;
   }
+
+  // This file gets sourced by sshd_config.
+  users_file << "Match User " + user_name + "\n";
+  users_file << "        AuthorizedKeysFile /dev/null\n";
 
   // We are only creating the file so we could just close it here.
   users_file.close();
@@ -1386,8 +1391,7 @@ bool AuthorizeUser(const char *user_name, struct AuthOptions opts, string *user_
     return result;
   }
 
-  users_filename = kUsersDir;
-  users_filename.append(user_name);
+  users_filename = string(kUsersDir) + user_name;
   users_file_exists = FileExists(users_filename.c_str());
 
   if (!ApplyPolicy(user_name, email, "login", opts)) {
@@ -1399,14 +1403,13 @@ bool AuthorizeUser(const char *user_name, struct AuthOptions opts, string *user_
     return false;
   }
 
-  if (!users_file_exists && !CreateGoogleUserFile(users_filename)) {
+  if (!users_file_exists && !CreateGoogleUserFile(kUsersDir, user_name)) {
     // If we can't create users file we can't grant access, log it and deny.
     SysLogErr("Failed to create user's file.");
     return false;
   }
 
-  sudoers_filename = kSudoersDir;
-  sudoers_filename.append(user_name);
+  sudoers_filename = string(kSudoersDir) + user_name;
   sudoers_exists = FileExists(sudoers_filename.c_str());
 
   if (ApplyPolicy(user_name, email, "adminLogin", opts)) {
