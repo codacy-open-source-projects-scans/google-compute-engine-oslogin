@@ -27,7 +27,7 @@ License:        ASL 2.0
 Source0:        %{name}_%{version}.orig.tar.gz
 Requires:       google-guest-agent >= 1:20231003
 %if 0%{?rhel} == 8
-Requires:       openssh-server >= 8.0p1-17
+Requires:       openssh-server >= 8.0p1-15
 %else
 Requires:       openssh-server >= 8.2p1
 %endif
@@ -86,6 +86,7 @@ make install DESTDIR=%{buildroot} LIBDIR=/%{_lib} VERSION=%{version} INSTALL_SEL
 /lib/systemd/system/google-oslogin-cache.service
 /lib/systemd/system/google-oslogin-cache.timer
 /lib/systemd/system-preset/90-google-compute-engine-oslogin.preset
+/var/google-users.d/README
 
 %post
 if [ $1 -eq 1 ]; then
