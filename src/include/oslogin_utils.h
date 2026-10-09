@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+#include "compat.h"
+
 #define TOTP "TOTP"
 #define AUTHZEN "AUTHZEN"
 #define INTERNAL_TWO_FACTOR "INTERNAL_TWO_FACTOR"
@@ -206,10 +208,6 @@ bool ValidatePasswd(struct passwd* result, BufferManager* buf, int* errnop);
 bool AddUsersToGroup(std::vector<string> users, struct group* result,
                      BufferManager* buf, int* errnop);
 
-// Iterates through all groups until one matching provided group is found,
-// replacing gr_name with a buffermanager provided string.
-bool FindGroup(struct group* grp, BufferManager* buf, int* errnop);
-
 // Iterates through all users for a group, storing results in a provided string
 // vector.
 bool GetUsersForGroup(string groupname, std::vector<string>* users,
@@ -230,18 +228,6 @@ bool GetGroupByName(string name, struct group* grp, BufferManager* buf, int* err
 
 // Gets group matching GID.
 bool GetGroupByGID(uint32_t gid, struct group* grp, BufferManager* buf, int* errnop);
-
-// Iterates through all users for a group, storing results in a provided string vector.
-bool GetUsersForGroup(string groupname, std::vector<string>* users, int* errnop);
-
-// Iterates through all groups for a user, storing results in a provided string vector.
-bool GetGroupsForUser(string username, std::vector<Group>* groups, int* errnop);
-
-// Parses a JSON groups response, storing results in a provided Group vector.
-bool ParseJsonToGroups(const string& json, std::vector<Group>* groups);
-
-// Parses a JSON users response, storing results in a provided string vector.
-bool ParseJsonToUsers(const string& json, std::vector<string> *users);
 
 // Parses a JSON LoginProfiles response for SSH keys. Returns a vector of valid
 // ssh_keys. A key is considered valid if it's expiration date is greater than
@@ -293,7 +279,7 @@ extern void SetupSysLog(const char *ident, const char *app);
 extern void CloseSysLog();
 
 // Prints out to sys logger with ERR severity.
-extern void SysLogErr(const char *fmt, ...);
+extern void SysLogErr(const char *fmt, ...) OSLOGIN_PRINTF_FORMAT(1, 2);
 
 // AuthoOptions wraps authorization options.
 struct AuthOptions {

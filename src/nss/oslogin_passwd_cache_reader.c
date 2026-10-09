@@ -22,6 +22,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include "include/oslogin_passwd_cache_reader.h"
@@ -43,8 +44,13 @@ struct passwd_cache_header {
 struct PasswdCache {
   void* map;
   size_t map_size;
+  int is_mmap;
   struct passwd_cache_header header;
 };
+
+// Size of the fixed header of a name index node in the cache file.
+// 8 bytes (text_offset) + 8 bytes (left_offset) + 8 bytes (right_offset) + 2 bytes (name_len) = 26 bytes.
+#define NAME_NODE_HEADER_SIZE 26
 
 // Because the file is a binary format, we need special functions to read
 // multi-byte values from the file in the correct endianness.
@@ -78,20 +84,63 @@ PasswdCache* open_passwd_cache(const char* filename) {
     return NULL;
   }
 
-  void* map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-  close(fd);
-  if (map == MAP_FAILED) {
+  if (st.st_size == 0) {
+    close(fd);
     return NULL;
   }
 
+  int is_mmap = 1;
+  void* map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+  if (map == MAP_FAILED) {
+    if (errno != EACCES) {
+      // If mmap fails for any reason other than SELinux denial, just bail out.
+      syslog(LOG_ERR, "mmap of %s failed: %s", filename, strerror(errno));
+      close(fd);
+      return NULL;
+    }
+
+    // If mmap fails due to SELinux denial (EACCES), it's likely that the
+    // current role lacks SELinux `map` permission, but it's possible that it
+    // does have the `open` and `read` permissions. So, try falling back to
+    // using read() to read the file into a heap buffer instead.
+    syslog(LOG_WARNING,
+           "mmap of %s failed (%s), falling back to heap read",
+           filename, strerror(errno));
+    is_mmap = 0;
+    map = malloc(st.st_size);
+    if (!map) {
+      close(fd);
+      return NULL;
+    }
+    size_t total_read = 0;
+    while (total_read < (size_t)st.st_size) {
+      ssize_t n = read(fd, (char*)map + total_read, st.st_size - total_read);
+      if (n <= 0) {
+        if (n < 0 && errno == EINTR) {
+          continue;
+        }
+        free(map);
+        close(fd);
+        return NULL;
+      }
+      total_read += n;
+    }
+  }
+  close(fd);
+
   PasswdCache* cache = (PasswdCache*)malloc(sizeof(PasswdCache));
   if (!cache) {
-    munmap(map, st.st_size);
+    if (is_mmap) {
+      munmap(map, st.st_size);
+    } else {
+      free(map);
+    }
     return NULL;
   }
 
   cache->map = map;
   cache->map_size = st.st_size;
+  cache->is_mmap = is_mmap;
 
   // Read header
   uint8_t* p = (uint8_t*)map;
@@ -106,8 +155,12 @@ PasswdCache* open_passwd_cache(const char* filename) {
   if (cache->header.uid_index_offset < 48 ||
       cache->header.name_index_offset < cache->header.uid_index_offset ||
       cache->header.text_offset < cache->header.name_index_offset ||
-      st.st_size < cache->header.text_offset + cache->header.text_len) {
-    munmap(map, st.st_size);
+      (size_t)st.st_size < cache->header.text_offset + cache->header.text_len) {
+    if (is_mmap) {
+      munmap(map, st.st_size);
+    } else {
+      free(map);
+    }
     free(cache);
     return NULL;
   }
@@ -117,7 +170,11 @@ PasswdCache* open_passwd_cache(const char* filename) {
 
 void close_passwd_cache(PasswdCache* cache) {
   if (cache) {
-    munmap(cache->map, cache->map_size);
+    if (cache->is_mmap) {
+      munmap(cache->map, cache->map_size);
+    } else {
+      free(cache->map);
+    }
     free(cache);
   }
 }
@@ -228,16 +285,19 @@ enum nss_status lookup_passwd_by_uid_r(PasswdCache* cache, uid_t uid,
       struct line_info info;
       if (get_line_info(cache, offset, &info) != 0) {
         *errnop = EINVAL;
-        return NSS_STATUS_TRYAGAIN;
+        return NSS_STATUS_UNAVAIL;
       }
       int rc = parse_passwd_line_r(
           info.start, info.len, result, buffer, buflen);
       if (rc == 0) {
         *errnop = 0;
         return NSS_STATUS_SUCCESS;
-      } else {
+      } else if (rc == ERANGE) {
         *errnop = rc;
         return NSS_STATUS_TRYAGAIN;
+      } else {
+        *errnop = rc;
+        return NSS_STATUS_UNAVAIL;
       }
     } else if (uid < current_uid) {
       k = 2 * k + 1;
@@ -266,11 +326,20 @@ enum nss_status lookup_passwd_by_name_r(PasswdCache* cache, const char* name,
   uint8_t* base = (uint8_t*)cache->map;
 
   while (current_offset != 0 && current_offset < cache->header.text_offset) {
+    if (current_offset + NAME_NODE_HEADER_SIZE > cache->map_size) {
+      *errnop = EINVAL;
+      return NSS_STATUS_UNAVAIL;
+    }
     uint64_t text_offset = read_le64(base + current_offset);
     uint64_t left_offset = read_le64(base + current_offset + 8);
     uint64_t right_offset = read_le64(base + current_offset + 16);
     uint16_t current_name_len = read_le16(base + current_offset + 24);
-    const char* current_name = (const char*)(base + current_offset + 26);
+
+    if (current_offset + NAME_NODE_HEADER_SIZE + current_name_len > cache->map_size) {
+      *errnop = EINVAL;
+      return NSS_STATUS_UNAVAIL;
+    }
+    const char* current_name = (const char*)(base + current_offset + NAME_NODE_HEADER_SIZE);
 
     // The comparison logic here implements lexicographical string comparison
     // for BST traversal. We first compare up to the minimum length of the
@@ -286,16 +355,19 @@ enum nss_status lookup_passwd_by_name_r(PasswdCache* cache, const char* name,
         struct line_info info;
         if (get_line_info(cache, text_offset, &info) != 0) {
           *errnop = EINVAL;
-          return NSS_STATUS_TRYAGAIN;
+          return NSS_STATUS_UNAVAIL;
         }
         int rc =
             parse_passwd_line_r(info.start, info.len, result, buffer, buflen);
         if (rc == 0) {
           *errnop = 0;
           return NSS_STATUS_SUCCESS;
-        } else {
+        } else if (rc == ERANGE) {
           *errnop = rc;
           return NSS_STATUS_TRYAGAIN;
+        } else {
+          *errnop = rc;
+          return NSS_STATUS_UNAVAIL;
         }
       }
       cmp = name_len < current_name_len ? -1 : 1;
@@ -354,7 +426,11 @@ enum nss_status passwd_cache_iter_next_r(PasswdCache* cache,
   int rc = parse_passwd_line_r(line_start, line_len, result, buffer, buflen);
   if (rc != 0) {
     *errnop = rc;
-    return NSS_STATUS_TRYAGAIN;
+    if (rc == ERANGE) {
+      return NSS_STATUS_TRYAGAIN;
+    } else {
+      return NSS_STATUS_UNAVAIL;
+    }
   }
 
   // Advance iterator to start of next line, or -1 if end of text.

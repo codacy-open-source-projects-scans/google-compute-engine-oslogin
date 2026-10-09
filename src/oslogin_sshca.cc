@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 
@@ -45,6 +46,8 @@ static SSHCertType sshca_impl[] = {
     { },
 };
 
+static const char kFingerprintKey[] = "fingerprint@google.com=";
+
 static int GetString(char **buff, size_t *blen, char **ptr, size_t *len_ptr) {
   u_int32_t len;
 
@@ -57,21 +60,28 @@ static int GetString(char **buff, size_t *blen, char **ptr, size_t *len_ptr) {
     return -1;
   }
 
-  if (len_ptr != NULL) {
-    *len_ptr = len;
-  }
-
   *buff = *buff + 4;
   *blen = *blen - 4;
 
   if (ptr != NULL) {
-    *ptr = (char *)malloc(len + 1);
+    if (len == (u_int32_t)-1) {
+      return -1;
+    }
+    *ptr = (char*)malloc((size_t)len + 1);
+    if (*ptr == NULL) {
+      return -1;
+    }
     memcpy(*ptr, *buff, len);
     ((char *)*ptr)[len] = '\0';
   }
 
   // Always move the buffer forward.
   *buff = *buff + len;
+  *blen = *blen - len;
+
+  if (len_ptr != NULL) {
+    *len_ptr = len;
+  }
 
   return 0;
 }
@@ -147,10 +157,11 @@ static int SkipECDSAFields(char **buff, size_t *blen) {
 
 static int GetExtension(const char *key, size_t k_len, char **exts, char **principal) {
   SSHCertType* impl = NULL;
-  size_t n_len, t_len, tmp_exts_len, tmp_prin_len, ret = -1;
-  char *tmp_exts, *tmp_prin, *tmp_head, *type, *key_b64, *head;
-
-  head = tmp_head = NULL;
+  size_t n_len = 0, t_len = 0, tmp_exts_len = 0, tmp_prin_len = 0, ext_len = 0;
+  char *ext_name = NULL, *tmp_exts = NULL, *tmp_prin = NULL,
+      *tmp_prin_head = NULL, *tmp_head = NULL, *type = NULL, *key_b64 = NULL,
+      *head = NULL;
+  int decoded_len = -1, ret = -1;
 
   head = key_b64 = (char *)calloc(k_len, sizeof(char));
   if (key_b64 == NULL) {
@@ -158,10 +169,30 @@ static int GetExtension(const char *key, size_t k_len, char **exts, char **princ
     goto out;
   }
 
-  if ((n_len = b64_pton(key, (u_char *)key_b64, k_len)) < 0) {
-    SysLogErr("Could encode buffer b64.");
+  {
+    size_t b64_len = 0;
+    while (b64_len < k_len && key[b64_len] != '\0' &&
+           !isspace((unsigned char)key[b64_len])) {
+      b64_len++;
+    }
+
+    char* b64_key = (char*)malloc(b64_len + 1);
+    if (b64_key == NULL) {
+      SysLogErr("Could not allocate b64 key buffer.");
+      goto out;
+    }
+    memcpy(b64_key, key, b64_len);
+    b64_key[b64_len] = '\0';
+
+    decoded_len = b64_pton(b64_key, (u_char*)key_b64, k_len);
+    free(b64_key);
+  }
+
+  if (decoded_len < 0) {
+    SysLogErr("Could not decode base64 key.");
     goto out;
   }
+  n_len = (size_t)decoded_len;
 
   // Invalid key (?)
   if (n_len <= 4) {
@@ -192,10 +223,16 @@ static int GetExtension(const char *key, size_t k_len, char **exts, char **princ
   }
 
   // Skip serial.
-  SKIP_UINT64(key_b64, n_len);
+  if (SkipUint64(&key_b64, &n_len) < 0) {
+    SysLogErr("Failed to skip cert's \"serial\" field.");
+    goto out;
+  }
 
   // Skip type.
-  SKIP_UINT32(key_b64, n_len);
+  if (SkipUint32(&key_b64, &n_len) < 0) {
+    SysLogErr("Failed to skip cert's \"type\" field.");
+    goto out;
+  }
 
   // Skip key id.
   if (GetString(&key_b64, &n_len, NULL, NULL) < 0) {
@@ -209,17 +246,25 @@ static int GetExtension(const char *key, size_t k_len, char **exts, char **princ
     goto out;
   }
 
-  // The field principal is a self described/sized buffer. Ignore the length of principal as it is not needed.
+  // The field principal is a self described/sized buffer.
+  // Ignore the length of principal as it is not needed.
+  tmp_prin_head = tmp_prin;
   if (GetString(&tmp_prin, &tmp_prin_len, principal, NULL) < 0) {
     SysLogErr("Failed to read principal.");
     goto out;
   }
 
   // Skip valid after.
-  SKIP_UINT64(key_b64, n_len);
+  if (SkipUint64(&key_b64, &n_len) < 0) {
+    SysLogErr("Failed to skip cert's \"valid after\" field.");
+    goto out;
+  }
 
   // Skip valid before.
-  SKIP_UINT64(key_b64, n_len);
+  if (SkipUint64(&key_b64, &n_len) < 0) {
+    SysLogErr("Failed to skip cert's \"valid before\" field.");
+    goto out;
+  }
 
   // Skip critical options.
   if (GetString(&key_b64, &n_len, NULL, NULL) < 0) {
@@ -233,14 +278,34 @@ static int GetExtension(const char *key, size_t k_len, char **exts, char **princ
     goto out;
   }
 
-  // The field extensions is a self described/sized buffer.
+  // The extensions field is a sequence of (name, data) string pairs. Google's
+  // fingerprint is encoded in an extension *name*; find the first such name.
   tmp_head = tmp_exts;
-  if (GetString(&tmp_exts, &tmp_exts_len, exts, &ret) < 0) {
-    SysLogErr("Failed to read Google's extension.");
-    goto out;
+  while (tmp_exts_len > 0) {
+    if (GetString(&tmp_exts, &tmp_exts_len, &ext_name, &ext_len) < 0) {
+      SysLogErr("Failed to read cert extension name.");
+      goto out;
+    }
+    if (strncmp(ext_name, kFingerprintKey, strlen(kFingerprintKey)) == 0) {
+      *exts = ext_name;
+      ext_name = NULL;
+      // Safe: ext_len <= n_len <= decoded_len, which is an int.
+      ret = (int)ext_len;
+      goto out;
+    }
+    free(ext_name);
+    ext_name = NULL;
+    // Skip the extension's data.
+    if (GetString(&tmp_exts, &tmp_exts_len, NULL, NULL) < 0) {
+      SysLogErr("Failed to skip cert extension data.");
+      goto out;
+    }
   }
+  SysLogErr("No Google fingerprint extension found in cert.");
 
 out:
+  free(ext_name);
+  free(tmp_prin_head);
   free(tmp_head);
   free(type);
   free(head);
@@ -249,26 +314,33 @@ out:
 }
 
 static size_t ExtractFingerPrint(const char *extension, char **out) {
-  const char *fingerprint_key = "fingerprint@google.com=";
-  
   if (extension == NULL) {
     return 0;
   }
 
-  const char *fingerprint_start = strstr(extension, fingerprint_key); 
+  const char *fingerprint_start = strstr(extension, kFingerprintKey);
   if (fingerprint_start == NULL) {
     return 0;
   }
 
-  fingerprint_start += strlen(fingerprint_key);
-  
+  fingerprint_start += strlen(kFingerprintKey);
+
+  if (*fingerprint_start == '\0') {
+    return 0;
+  }
+
   *out = strdup(fingerprint_start);
- 
+  if (*out == NULL) {
+    // Failed to allocate memory for fingerprint.
+    return 0;
+  }
+
   return strlen(*out);
 }
 
 static int GetByoidFingerPrint(const char *blob, char **fingerprint, char **principal) {
-  size_t f_len, exts_len = -1;
+  size_t f_len = 0;
+  int exts_len = -1;
   char *exts = NULL;
 
   exts_len = GetExtension(blob, strlen(blob), &exts, principal);
@@ -301,7 +373,8 @@ int FingerPrintFromBlob(const char *blob, char **fingerprint, char ** principal)
   }
 
   if (principal == NULL) {
-    SysLogErr("Could not parse/extract pincipal from SSH CA cert: \"principal\" is NULL.");
+    SysLogErr("Could not parse/extract principal from SSH CA cert: \"principal\" is NULL.");
+    return 0;
   }
 
   return GetByoidFingerPrint(blob, fingerprint, principal);

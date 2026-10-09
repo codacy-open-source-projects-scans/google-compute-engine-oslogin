@@ -18,11 +18,13 @@
 #include <errno.h>
 #include <grp.h>
 #include <json.h>
+#include <json_util.h>
 #include <nss.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 
 #include <cstdint>
@@ -60,6 +62,8 @@ static const char kUserNameRegex[] = "^[a-zA-Z0-9._][a-zA-Z0-9._-]{0,31}$";
 static const char kSudoersDir[] = "/var/google-sudoers.d/";
 static const char kUsersDir[] = "/var/google-users.d/";
 
+static const char kUnsafeNssFieldChars[] = ":\n\r";
+
 namespace oslogin_utils {
 
 // SysLog wraps syslog operations.
@@ -91,9 +95,16 @@ SysLog::SysLog(const char *ident, const char *app) {
 }
 
 void SysLog::Error(const char *fmt, va_list args) {
-  std::stringstream new_fmt;
-  new_fmt << this->app << ": " << fmt;
-  vsyslog(LOG_ERR, new_fmt.str().c_str(), args);
+  // app comes from argv[0], so double any '%' to keep it from being
+  // interpreted as a format directive.
+  std::string new_fmt;
+  for (const char *p = this->app; *p != '\0'; ++p) {
+    new_fmt += *p;
+    if (*p == '%') new_fmt += '%';
+  }
+  new_fmt += ": ";
+  new_fmt += fmt;
+  vsyslog(LOG_ERR, new_fmt.c_str(), args);
 }
 
 void SysLog::Close() {
@@ -404,6 +415,20 @@ bool NssCache::NssGetgrentHelper(BufferManager* buf, struct group* result, int* 
 
 // ----------------- HTTP functions -----------------
 
+// Initializes libcurl exactly once per process. Safe to call from any thread:
+// C++11 guarantees thread-safe initialization of function-local statics.
+// (pthread_once would also work, but needs -pthread at link time on
+// glibc < 2.34, e.g. EL7 and EL8.)
+//
+// Intentionally never paired with curl_global_cleanup. This code runs inside
+// arbitrary host processes via NSS and PAM, and so it must not tear down
+// process-global libcurl state that the host may also be using.
+static bool EnsureCurlInitialized() {
+  static const CURLcode curl_init_result =
+      curl_global_init(CURL_GLOBAL_ALL & ~CURL_GLOBAL_SSL);
+  return curl_init_result == CURLE_OK;
+}
+
 size_t OnCurlWrite(void* buf, size_t size, size_t nmemb, void* userp) {
   if (userp) {
     std::ostream& os = *static_cast<std::ostream*>(userp);
@@ -436,7 +461,9 @@ bool HttpDo(const string& url, const string& data, string* response, long* http_
     return false;
   }
   CURLcode code(CURLE_FAILED_INIT);
-  curl_global_init(CURL_GLOBAL_ALL & ~CURL_GLOBAL_SSL);
+  if (!EnsureCurlInitialized()) {
+    return false;
+  }
   CURL* curl = curl_easy_init();
   std::ostringstream response_stream;
   int retry_count = 0;
@@ -445,7 +472,6 @@ bool HttpDo(const string& url, const string& data, string* response, long* http_
     header_list = curl_slist_append(header_list, "Metadata-Flavor: Google");
     if (header_list == NULL) {
       curl_easy_cleanup(curl);
-      curl_global_cleanup();
       return false;
     }
     do {
@@ -458,7 +484,10 @@ bool HttpDo(const string& url, const string& data, string* response, long* http_
       curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
       curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &OnCurlWrite);
       curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_stream);
-      curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5);
+      curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+      // We run in multithreaded hosts. By default, libcurl ignores SIGPIPE and
+      // then restores the old handler. This can be racy in threaded programs.
+      curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
       curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
       if (data != "") {
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
@@ -466,8 +495,8 @@ bool HttpDo(const string& url, const string& data, string* response, long* http_
 
       code = curl_easy_perform(curl);
       if (code != CURLE_OK) {
+        curl_slist_free_all(header_list);
         curl_easy_cleanup(curl);
-        curl_global_cleanup();
         return false;
       }
       curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, http_code);
@@ -476,7 +505,6 @@ bool HttpDo(const string& url, const string& data, string* response, long* http_
   }
   *response = response_stream.str();
   curl_easy_cleanup(curl);
-  curl_global_cleanup();
   return true;
 }
 
@@ -489,6 +517,9 @@ bool HttpPost(const string& url, const string& data, string* response, long* htt
 }
 
 string UrlEncode(const string& param) {
+  if (!EnsureCurlInitialized()) {
+    return "";
+  }
   CURL* curl = curl_easy_init();
   char* encoded = curl_easy_escape(curl, param.c_str(), param.length());
   if (encoded == NULL) {
@@ -501,22 +532,33 @@ string UrlEncode(const string& param) {
   return encoded_param;
 }
 
+// Returns true if the value can be embedded in a colon-delimited,
+// newline-terminated NSS cache record without corrupting it.
+static bool IsSafeNssField(const char* value) {
+  return value != nullptr && strpbrk(value, kUnsafeNssFieldChars) == nullptr;
+}
+
 bool ValidateUserName(const string& user_name) {
   Regex::regex r(kUserNameRegex);
   return Regex::regex_match(user_name, r);
 }
 
 bool ValidatePasswd(struct passwd* result, BufferManager* buf, int* errnop) {
-  // OS Login disallows uids less than 1000.
+  // OS Login disallows uids and gids less than 1000.
   if (result->pw_uid < 1000) {
     *errnop = EINVAL;
     return false;
   }
-  if (result->pw_gid == 0) {
+  if (result->pw_gid < 1000) {
     *errnop = EINVAL;
     return false;
   }
   if (strlen(result->pw_name) == 0) {
+    *errnop = EINVAL;
+    return false;
+  }
+  if (!IsSafeNssField(result->pw_name) || !IsSafeNssField(result->pw_dir) ||
+      !IsSafeNssField(result->pw_shell)) {
     *errnop = EINVAL;
     return false;
   }
@@ -566,6 +608,10 @@ bool ParseJsonToUsers(const string& json, std::vector<string>* result) {
   for (int idx=0; idx < (int)json_object_array_length(users); idx++) {
     json_object* user = json_object_array_get_idx(users, idx);
     const char* username = json_object_get_string(user);
+    if (!IsSafeNssField(username)) {
+      SysLogErr("Rejecting group member with missing or unsafe username.");
+      goto cleanup;
+    }
     result->push_back(string(username));
   }
   ret = true;
@@ -591,7 +637,7 @@ bool ParseJsonToGroups(const string& json, std::vector<Group>* result) {
   groupType = json_object_get_type(groups);
   if (groupType != json_type_array) {
     SysLogErr("parsed unexpected type for field \"posixGroups\"; "
-              "want a list, got %s", groupType);
+              "want a list, got %s", json_type_to_name(groupType));
     goto cleanup;
   }
   for (int idx = 0; idx < (int)json_object_array_length(groups); idx++) {
@@ -621,10 +667,12 @@ bool ParseJsonToGroups(const string& json, std::vector<Group>* result) {
       goto cleanup;
     }
 
-    g.name = json_object_get_string(name);
-    if (g.name == "") {
+    const char* group_name = json_object_get_string(name);
+    if (!IsSafeNssField(group_name) || group_name[0] == '\0') {
+      SysLogErr("Rejecting group with unsafe, missing, or empty group name.");
       goto cleanup;
     }
+    g.name = group_name;
 
     result->push_back(g);
   }
@@ -655,14 +703,21 @@ bool ParseJsonToGroup(const string& json, struct group* result, BufferManager*
     goto cleanup;
   }
 
+  // No initializer: `goto cleanup` above may bypass initializers.
+  const char* group_name;
   if ((gr_gid = json_object_get_int64(gid)) == 0) {
+    goto cleanup;
+  }
+
+  group_name = json_object_get_string(name);
+  if (!IsSafeNssField(group_name)) {
     goto cleanup;
   }
 
   result->gr_gid = gr_gid;
   if (!buf->AppendString("", &result->gr_passwd, errnop))
     goto cleanup;
-  if (!buf->AppendString(json_object_get_string(name), &result->gr_name,
+  if (!buf->AppendString(group_name, &result->gr_name,
                          errnop))
     goto cleanup;
 
@@ -832,6 +887,7 @@ bool ParseJsonToPasswd(const string& json, struct passwd* result, BufferManager*
   // Populate with some default values that ValidatePasswd can detect if they
   // are not set.
   result->pw_uid = 0;
+  result->pw_gid = 0;
   result->pw_shell = (char*)"";
   result->pw_name = (char*)"";
   result->pw_dir = (char*)"";
@@ -861,10 +917,6 @@ bool ParseJsonToPasswd(const string& json, struct passwd* result, BufferManager*
     } else if (string_key == "gid") {
       if (val_type == json_type_int || val_type == json_type_string) {
         result->pw_gid = (uint32_t)json_object_get_int64(val);
-        // Use the uid as the default group when gid is not set or is zero.
-        if (result->pw_gid == 0) {
-          result->pw_gid = result->pw_uid;
-        }
       } else {
         goto cleanup;
       }
@@ -894,6 +946,10 @@ bool ParseJsonToPasswd(const string& json, struct passwd* result, BufferManager*
       }
     }
   }
+  }
+  // Use the uid as the default group when gid is not set or is zero.
+  if (result->pw_gid == 0) {
+    result->pw_gid = result->pw_uid;
   }
   *errnop = 0;
   ret = ValidatePasswd(result, buf, errnop);
@@ -1100,7 +1156,7 @@ bool GetGroupByName(string name, struct group* result, BufferManager* buf, int* 
   long http_code;
 
   url.str("");
-  url << kMetadataServerUrl << "groups?groupname=" << name;
+  url << kMetadataServerUrl << "groups?groupname=" << UrlEncode(name);
 
   response.clear();
   http_code = 0;
@@ -1166,7 +1222,7 @@ bool GetUsersForGroup(string groupname, std::vector<string>* users, int* errnop)
 
   do {
     url.str("");
-    url << kMetadataServerUrl << "users?groupname=" << groupname;
+    url << kMetadataServerUrl << "users?groupname=" << UrlEncode(groupname);
     if (pageToken != "")
       url << "&pagetoken=" << pageToken;
 
@@ -1272,7 +1328,7 @@ bool ContinueSession(bool alt, const string& email, const string& user_token, co
   data = json_object_to_json_string_ext(jobj, JSON_C_TO_STRING_PLAIN);
 
   std::stringstream url;
-  url << kMetadataServerUrl << "authenticate/sessions/" << session_id
+  url << kMetadataServerUrl << "authenticate/sessions/" << UrlEncode(session_id)
       << "/continue";
   long http_code = 0;
   if (!HttpPost(url.str(), data, response, &http_code) || response->empty() ||
@@ -1303,9 +1359,10 @@ static bool ApplyPolicy(const char *user_name, string email, const char *policy,
   }
 
   if (http_code != 200) {
-    SysLogErr("Failed to validate that OS Login user %s has %s permission; "
-              "got HTTP response code: %lu; got HTTP response body: %s",
-              user_name, policy, http_code, response);
+    SysLogErr(
+        "Failed to validate that OS Login user %s has %s permission; "
+        "got HTTP response code: %ld; got HTTP response body: %s",
+        user_name, policy, http_code, response.c_str());
     return false;
   }
 
@@ -1319,55 +1376,53 @@ static bool ApplyPolicy(const char *user_name, string email, const char *policy,
 
 static bool FileExists(const char *file_path) {
   struct stat buff;
-  return !stat(file_path, &buff);
+  return !lstat(file_path, &buff);
 }
 
 static bool CreateGoogleUserFile(string users_filedir, string user_name) {
-  std::ofstream users_file;
-
   string users_filename = (users_filedir + user_name);
-  users_file.open(users_filename.c_str());
-
-  if (!users_file.is_open()) {
+  mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP;
+  int fd = open(users_filename.c_str(),
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode);
+  if (fd < 0) {
     // If we can't open the file (meaning we can't create it) we should report failure.
     return false;
   }
 
   // This file gets sourced by sshd_config.
-  users_file << "Match User " + user_name + "\n";
-  users_file << "        AuthorizedKeysFile /dev/null\n";
+  string content = "Match User " + user_name + "\n"
+                   "        AuthorizedKeysFile /dev/null\n";
+  write(fd, content.c_str(), content.length());
 
   // We are only creating the file so we could just close it here.
-  users_file.close();
+  fchown(fd, 0, 0);
+  fchmod(fd, mode);
+  close(fd);
 
-  chown(users_filename.c_str(), 0, 0);
-  chmod(users_filename.c_str(), S_IRUSR | S_IWUSR | S_IRGRP);
   return true;
 }
 
 static bool CreateGoogleSudoersFile(string sudoers_filename, const char *user_name) {
-  std::ofstream sudoers_file;
-
-  sudoers_file.open(sudoers_filename.c_str());
-
-  if (!sudoers_file.is_open()) {
+  mode_t mode = S_IRUSR | S_IRGRP;
+  int fd = open(sudoers_filename.c_str(),
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode);
+  if (fd < 0) {
     // If we can't open the file (meaning we can't create it) we should report failure.
     return false;
   }
 
-  sudoers_file << user_name << " ALL=(ALL) NOPASSWD: ALL\n";
-  sudoers_file.close();
+  string content = string(user_name) + " ALL=(ALL) NOPASSWD: ALL\n";
+  write(fd, content.c_str(), content.length());
 
-  chown(sudoers_filename.c_str(), 0, 0);
-  chmod(sudoers_filename.c_str(), S_IRUSR | S_IRGRP);
+  fchown(fd, 0, 0);
+  fchmod(fd, mode);
+  close(fd);
+
   return true;
 }
 
 bool AuthorizeUser(const char *user_name, struct AuthOptions opts, string *user_response, bool cloud_run) {
-  bool users_file_exists, sudoers_exists;
   string email, users_filename, sudoers_filename;
-
-  users_file_exists = sudoers_exists = false;
 
   if (!ValidateUserName(user_name)) {
     return false;
@@ -1392,29 +1447,25 @@ bool AuthorizeUser(const char *user_name, struct AuthOptions opts, string *user_
   }
 
   users_filename = string(kUsersDir) + user_name;
-  users_file_exists = FileExists(users_filename.c_str());
 
   if (!ApplyPolicy(user_name, email, "login", opts)) {
     // Couldn't apply "login" policy for user in question, log it and deny.
     SysLogErr("Could not grant access to organization user: %s.", user_name);
-    if (users_file_exists) {
-      remove(users_filename.c_str());
-    }
+    remove(users_filename.c_str());
     return false;
   }
 
-  if (!users_file_exists && !CreateGoogleUserFile(kUsersDir, user_name)) {
+  if (!FileExists(users_filename.c_str()) && !CreateGoogleUserFile(kUsersDir, user_name)) {
     // If we can't create users file we can't grant access, log it and deny.
     SysLogErr("Failed to create user's file.");
     return false;
   }
 
   sudoers_filename = string(kSudoersDir) + user_name;
-  sudoers_exists = FileExists(sudoers_filename.c_str());
 
   if (ApplyPolicy(user_name, email, "adminLogin", opts)) {
     // Best effort creating sudoers file, if we fail log it and grant access.
-    if (!sudoers_exists && !CreateGoogleSudoersFile(sudoers_filename, user_name)) {
+    if (!FileExists(sudoers_filename.c_str()) && !CreateGoogleSudoersFile(sudoers_filename, user_name)) {
       SysLogErr("Could not grant sudo permissions to organization user %s."
                 " Sudoers file %s is not writable.", user_name, sudoers_filename.c_str());
     }
@@ -1429,17 +1480,7 @@ bool AuthorizeUser(const char *user_name, struct AuthOptions opts, string *user_
 }
 
 const char *FileName(const char *file_path) {
-  int res_start = 0;
-  for (int i = 0; file_path[i] != '\0'; i++) {
-    if (file_path[i] == '/') {
-      res_start = i;
-    }
-  }
-
-  if (res_start > 0) {
-    return file_path + res_start + 1;
-  }
-
-  return file_path;
+  const char *last_slash = strrchr(file_path, '/');
+  return last_slash ? last_slash + 1 : file_path;
 }
 }  // namespace oslogin_utils

@@ -38,6 +38,16 @@ In addition to the main components, there are also the following utilities:
 The **packaging** directory also contains files used to generate `.deb` and
 `.rpm` packages for the OS Login components.
 
+## Contributing
+
+**Googlers:** Please contribute to this repository via our internal version
+control system. We automatically copy internal changes out to GitHub after they
+are merged internally.
+
+**External Contributors:** We welcome external contributions! Please open a Pull
+Request on GitHub, and our team will review and import it into our internal
+repository.
+
 ## Components
 
 #### Authorized Keys Command

@@ -14,9 +14,15 @@
 
 // Requires libgtest-dev and gtest compiled and installed.
 #include <errno.h>
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
+#include <thread>
+#include <unistd.h>
+
+#include <string>
 
 #include "oslogin_utils.h"
 
@@ -108,6 +114,39 @@ TEST(NssCacheTest, TestLoadJsonArray) {
   ASSERT_FALSE(nss_cache.GetNextPasswd(&buf, &result, &test_errno));
   ASSERT_EQ(test_errno, ENOENT);
 }
+
+// The cache refresher skips entries that fail with EINVAL and keeps going, so
+// an entry with a delimiter in a field must not affect the entries after it.
+TEST(NssCacheTest, SkipsPasswdEntryWithDelimiterInField) {
+  NssCache nss_cache(2);
+  string bad_user =
+      "{\"name\":\"bad@example.com\",\"posixAccounts\":["
+      "{\"primary\":true,\"username\":\"a:b\",\"uid\":1337,\"gid\":1337,"
+      "\"homeDirectory\":\"/home/a\",\"shell\":\"/bin/bash\"}]}";
+  string good_user =
+      "{\"name\":\"bar@example.com\",\"posixAccounts\":["
+      "{\"primary\":true,\"username\":\"bar\",\"uid\":1338,\"gid\":1338,"
+      "\"homeDirectory\":\"/home/bar\",\"shell\":\"/bin/bash\"}]}";
+  string response = "{\"loginProfiles\": [" + bad_user + ", " + good_user +
+                    "], \"nextPageToken\": \"token\"}";
+  ASSERT_TRUE(nss_cache.LoadJsonUsersToCache(response));
+
+  size_t buflen = 500;
+  char* buffer = (char*)malloc(buflen * sizeof(char));
+  ASSERT_STRNE(buffer, NULL);
+  BufferManager buf(buffer, buflen);
+  struct passwd result;
+  int test_errno = 0;
+
+  ASSERT_FALSE(nss_cache.GetNextPasswd(&buf, &result, &test_errno));
+  ASSERT_EQ(test_errno, EINVAL);
+
+  test_errno = 0;
+  ASSERT_TRUE(nss_cache.GetNextPasswd(&buf, &result, &test_errno));
+  ASSERT_EQ(test_errno, 0);
+  ASSERT_STREQ(result.pw_name, "bar");
+}
+
 
 // Test successfully loading and retrieving a partial array.
 TEST(NssCacheTest, TestLoadJsonPartialArray) {
@@ -257,6 +296,115 @@ TEST(ParseJsonPasswdTest, ParseJsonToPasswdNoLoginProfilesSucceeds) {
   ASSERT_STREQ(result.pw_dir, "/home/foo");
 }
 
+TEST(ParseJsonPasswdTest, ParseJsonToPasswdFailsWithLowGid) {
+  string test_user =
+      "{\"loginProfiles\":[{\"name\":\"foo@example.com\",\"posixAccounts\":["
+      "{\"primary\":true,\"username\":\"foo\",\"uid\":2001,\"gid\":6,"
+      "\"homeDirectory\":\"/home/foo\",\"shell\":\"/bin/bash\"}]}]}";
+
+  size_t buflen = 200;
+  char* buffer = (char*)malloc(buflen * sizeof(char));
+  ASSERT_STRNE(buffer, NULL);
+  BufferManager buf(buffer, buflen);
+  struct passwd result;
+  int test_errno = 0;
+  ASSERT_FALSE(ParseJsonToPasswd(test_user, &result, &buf, &test_errno));
+  ASSERT_EQ(test_errno, EINVAL);
+}
+
+TEST(ParseJsonPasswdTest, ParseJsonToPasswdFailsWithLowGidString) {
+  string test_user =
+      "{\"loginProfiles\":[{\"name\":\"foo@example.com\",\"posixAccounts\":["
+      "{\"primary\":true,\"username\":\"foo\",\"uid\":\"2001\",\"gid\":\"6\","
+      "\"homeDirectory\":\"/home/foo\",\"shell\":\"/bin/bash\"}]}]}";
+
+  size_t buflen = 200;
+  char* buffer = (char*)malloc(buflen * sizeof(char));
+  ASSERT_STRNE(buffer, NULL);
+  BufferManager buf(buffer, buflen);
+  struct passwd result;
+  int test_errno = 0;
+  ASSERT_FALSE(ParseJsonToPasswd(test_user, &result, &buf, &test_errno));
+  ASSERT_EQ(test_errno, EINVAL);
+}
+
+TEST(ParseJsonPasswdTest, ParseJsonToPasswdFailsWithGid999) {
+  string test_user =
+      "{\"loginProfiles\":[{\"name\":\"foo@example.com\",\"posixAccounts\":["
+      "{\"primary\":true,\"username\":\"foo\",\"uid\":2001,\"gid\":999,"
+      "\"homeDirectory\":\"/home/foo\",\"shell\":\"/bin/bash\"}]}]}";
+
+  size_t buflen = 200;
+  char* buffer = (char*)malloc(buflen * sizeof(char));
+  ASSERT_STRNE(buffer, NULL);
+  BufferManager buf(buffer, buflen);
+  struct passwd result;
+  int test_errno = 0;
+  ASSERT_FALSE(ParseJsonToPasswd(test_user, &result, &buf, &test_errno));
+  ASSERT_EQ(test_errno, EINVAL);
+}
+
+TEST(ParseJsonPasswdTest, ParseJsonToPasswdSucceedsWithGid1000) {
+  string test_user =
+      "{\"loginProfiles\":[{\"name\":\"foo@example.com\",\"posixAccounts\":["
+      "{\"primary\":true,\"username\":\"foo\",\"uid\":1000,\"gid\":1000,"
+      "\"homeDirectory\":\"/home/foo\",\"shell\":\"/bin/bash\"}]}]}";
+
+  size_t buflen = 200;
+  char* buffer = (char*)malloc(buflen * sizeof(char));
+  ASSERT_STRNE(buffer, NULL);
+  BufferManager buf(buffer, buflen);
+  struct passwd result;
+  int test_errno = 0;
+  ASSERT_TRUE(ParseJsonToPasswd(test_user, &result, &buf, &test_errno));
+  ASSERT_EQ(result.pw_uid, 1000);
+  ASSERT_EQ(result.pw_gid, 1000);
+  ASSERT_STREQ(result.pw_name, "foo");
+  ASSERT_STREQ(result.pw_shell, "/bin/bash");
+  ASSERT_STREQ(result.pw_dir, "/home/foo");
+}
+
+TEST(ParseJsonPasswdTest, ParseJsonToPasswdSucceedsWithGidZeroDefaultsToUid) {
+  string test_user =
+      "{\"loginProfiles\":[{\"name\":\"foo@example.com\",\"posixAccounts\":["
+      "{\"primary\":true,\"username\":\"foo\",\"uid\":2001,\"gid\":0,"
+      "\"homeDirectory\":\"/home/foo\",\"shell\":\"/bin/bash\"}]}]}";
+
+  size_t buflen = 200;
+  char* buffer = (char*)malloc(buflen * sizeof(char));
+  ASSERT_STRNE(buffer, NULL);
+  BufferManager buf(buffer, buflen);
+  struct passwd result;
+  int test_errno = 0;
+  ASSERT_TRUE(ParseJsonToPasswd(test_user, &result, &buf, &test_errno));
+  ASSERT_EQ(result.pw_uid, 2001);
+  ASSERT_EQ(result.pw_gid, 2001);
+  ASSERT_STREQ(result.pw_name, "foo");
+  ASSERT_STREQ(result.pw_shell, "/bin/bash");
+  ASSERT_STREQ(result.pw_dir, "/home/foo");
+}
+
+TEST(ParseJsonPasswdTest,
+     ParseJsonToPasswdSucceedsWithOmittedGidDefaultsToUid) {
+  string test_user =
+      "{\"loginProfiles\":[{\"name\":\"foo@example.com\",\"posixAccounts\":["
+      "{\"primary\":true,\"username\":\"foo\",\"uid\":2001,"
+      "\"homeDirectory\":\"/home/foo\",\"shell\":\"/bin/bash\"}]}]}";
+
+  size_t buflen = 200;
+  char* buffer = (char*)malloc(buflen * sizeof(char));
+  ASSERT_STRNE(buffer, NULL);
+  BufferManager buf(buffer, buflen);
+  struct passwd result;
+  int test_errno = 0;
+  ASSERT_TRUE(ParseJsonToPasswd(test_user, &result, &buf, &test_errno));
+  ASSERT_EQ(result.pw_uid, 2001);
+  ASSERT_EQ(result.pw_gid, 2001);
+  ASSERT_STREQ(result.pw_name, "foo");
+  ASSERT_STREQ(result.pw_shell, "/bin/bash");
+  ASSERT_STREQ(result.pw_dir, "/home/foo");
+}
+
 // Test parsing a JSON response without enough space in the buffer.
 TEST(ParseJsonPasswdTest, ParseJsonToPasswdFailsWithERANGE) {
   string test_user =
@@ -302,6 +450,33 @@ TEST(ParseJsonPasswdTest, ParseJsonToPasswdFailsWithEINVAL) {
   ASSERT_EQ(result.pw_uid, 1337);
   ASSERT_EQ(result.pw_gid, 1337);
 }
+
+// A colon or newline in a passwd field would corrupt the NSS cache record.
+TEST(ParseJsonPasswdTest, ParseJsonToPasswdFailsWithDelimiterInField) {
+  string colon_in_username =
+      "{\"loginProfiles\":[{\"name\":\"foo@example.com\",\"posixAccounts\":["
+      "{\"primary\":true,\"username\":\"a:b\",\"uid\":1337,\"gid\":1338,"
+      "\"homeDirectory\":\"/home/foo\",\"shell\":\"/bin/bash\"}]}]}";
+  string newline_in_home =
+      "{\"loginProfiles\":[{\"name\":\"foo@example.com\",\"posixAccounts\":["
+      "{\"primary\":true,\"username\":\"foo\",\"uid\":1337,\"gid\":1338,"
+      "\"homeDirectory\":\"/home/foo\\nroot\",\"shell\":\"/bin/bash\"}]}]}";
+
+  size_t buflen = 200;
+  char* buffer = (char*)malloc(buflen * sizeof(char));
+  ASSERT_STRNE(buffer, NULL);
+  BufferManager buf(buffer, buflen);
+  struct passwd result;
+  int test_errno = 0;
+  ASSERT_FALSE(
+      ParseJsonToPasswd(colon_in_username, &result, &buf, &test_errno));
+  ASSERT_EQ(test_errno, EINVAL);
+
+  test_errno = 0;
+  ASSERT_FALSE(ParseJsonToPasswd(newline_in_home, &result, &buf, &test_errno));
+  ASSERT_EQ(test_errno, EINVAL);
+}
+
 
 // Test parsing a partially filled response. Validate should fill empty fields
 // with default values.
@@ -388,6 +563,27 @@ TEST(ParseJsonToGroupsTest, ParseJsonToGroupsFails) {
   ASSERT_FALSE(ParseJsonToGroups(test_noname, &groups));
 }
 
+// A newline in the group name would inject an extra record into the NSS cache.
+TEST(ParseJsonToGroupsTest, RejectsNewlineInGroupName) {
+  string test_group =
+      "{\"posixGroups\":[{\"name\":\"g\\nsudo\",\"gid\":123452}]}";
+
+  std::vector<Group> groups;
+  ASSERT_FALSE(ParseJsonToGroups(test_group, &groups));
+}
+
+// A non-array "posixGroups" must be rejected, and logging the rejection must
+// not crash. SysLogErr is a no-op until SetupSysLog is called, so enable it to
+// actually exercise the format string (regression test for b/511890408).
+TEST(ParseJsonToGroupsTest, RejectsNonArrayPosixGroupsWithLoggingEnabled) {
+  SetupSysLog("oslogin_utils_test", "ParseJsonToGroupsTest");
+  std::vector<Group> groups;
+  EXPECT_FALSE(ParseJsonToGroups("{\"posixGroups\":5}", &groups));
+  EXPECT_FALSE(
+      ParseJsonToGroups("{\"posixGroups\":{\"name\":\"demo\"}}", &groups));
+  EXPECT_TRUE(groups.empty());
+}
+
 // Test parsing a valid JSON response from the metadata server.
 TEST(ParseJsonToUsersTest, ParseJsonToUsersSucceeds) {
   string test_group_users =
@@ -413,6 +609,22 @@ TEST(ParseJsonToUsersTest, ParseJsonToUsersEmptyGroupSucceeds) {
   std::vector<string> users;
   ASSERT_TRUE(ParseJsonToUsers(test_group_users, &users));
   ASSERT_TRUE(users.empty());
+}
+
+// A colon in a username would shift fields in the group member list.
+TEST(ParseJsonToUsersTest, RejectsColonInUsername) {
+  string test_group_users = "{\"usernames\":[\"user0001\",\"a:b\"]}";
+
+  std::vector<string> users;
+  ASSERT_FALSE(ParseJsonToUsers(test_group_users, &users));
+}
+
+// json_object_get_string returns NULL for a JSON null element.
+TEST(ParseJsonToUsersTest, RejectsNullUsername) {
+  string test_group_users = "{\"usernames\":[\"user0001\",null]}";
+
+  std::vector<string> users;
+  ASSERT_FALSE(ParseJsonToUsers(test_group_users, &users));
 }
 
 TEST(GetUsersForGroupTest, GetUsersForGroupSucceeds) {
@@ -467,6 +679,21 @@ TEST(CurlClient, RetryLogic) {
   ASSERT_FALSE(ShouldRetry(404));
   ASSERT_FALSE(ShouldRetry(400));
   ASSERT_TRUE(ShouldRetry(429));
+}
+
+// Exercises the curl_easy_perform failure path. The assertion alone can't see
+// a leak; run under --config=asan so LeakSanitizer can. Requests run on a
+// separate thread (its stack is gone after join, so stale stack slots can't
+// hide a leaked pointer) and repeat so one masked block can't hide the leak.
+TEST(CurlClient, HttpGetFailsCleanlyWhenUnreachable) {
+  std::thread worker([] {
+    for (int i = 0; i < 50; ++i) {
+      string response;
+      long http_code = 0;
+      EXPECT_FALSE(HttpGet("http://127.0.0.1:1/", &response, &http_code));
+    }
+  });
+  worker.join();
 }
 
 TEST(ParseJsonEmailTest, SuccessfullyParsesEmail) {
@@ -616,6 +843,15 @@ TEST(ParseJsonChallengesTest, TestMalformedChallenges) {
   ASSERT_EQ(challenges.size(), 1);
 }
 
+TEST(ParseJsonChallengesTest, TestEmptyChallenges) {
+  string challenges_json =
+      "{\"status\":\"CHALLENGE_REQUIRED\",\"sessionId\":\"testSessionId\","
+      "\"challenges\":[]}";
+  vector<Challenge> challenges;
+  ASSERT_TRUE(ParseJsonToChallenges(challenges_json, &challenges));
+  ASSERT_TRUE(challenges.empty());
+}
+
 TEST(ParseJsonToGroupTest, TestGroups) {
   size_t buflen = 20;
   char* buffer = (char*)malloc(buflen *sizeof(char));
@@ -632,6 +868,20 @@ TEST(ParseJsonToGroupTest, TestGroups) {
   ASSERT_STREQ(result.gr_passwd, "");
 }
 
+// A newline in the group name would inject an extra record into the NSS cache.
+TEST(ParseJsonToGroupTest, RejectsNewlineInGroupName) {
+  size_t buflen = 200;
+  char* buffer = (char*)malloc(buflen * sizeof(char));
+  ASSERT_STRNE(buffer, NULL);
+  BufferManager buf(buffer, buflen);
+
+  string group_json = "{\"name\":\"g\\nsudo\",\"gid\":\"123452\"}";
+  struct group result;
+  int errnop = 0;
+  ASSERT_FALSE(ParseJsonToGroup(group_json, &result, &buf, &errnop));
+  ASSERT_EQ(errnop, EINVAL);
+}
+
 TEST(ParseJsonToGroupsTest, TestGroups) {
   string group_json = "{\"posixGroups\": [{\"name\":\"mygroup\",\"gid\":\"123452\"},{\"name\":\"mygroup2\",\"gid\":\"123453\"}]}";
   vector<Group> groups;
@@ -641,6 +891,117 @@ TEST(ParseJsonToGroupsTest, TestGroups) {
   ASSERT_EQ(groups[1].gid, 123453);
   ASSERT_STREQ(groups[0].name.c_str(), "mygroup");
   ASSERT_STREQ(groups[1].name.c_str(), "mygroup2");
+}
+
+TEST(UrlEncodeTest, EncodesSpecialCharacters) {
+  EXPECT_EQ(UrlEncode("abc"), "abc");
+  EXPECT_EQ(UrlEncode("a b"), "a%20b");
+  EXPECT_EQ(UrlEncode("a&b"), "a%26b");
+  EXPECT_EQ(UrlEncode("a/b"), "a%2Fb");
+}
+
+TEST(AuthorizeUserTest, RejectsInvalidUserNames) {
+  struct AuthOptions opts = {};
+  string user_response;
+
+  // Empty username.
+  EXPECT_FALSE(AuthorizeUser("", opts, &user_response));
+
+  // Traversal and path separator injection attempts.
+  EXPECT_FALSE(AuthorizeUser("../victim", opts, &user_response));
+  EXPECT_FALSE(AuthorizeUser("users/foo", opts, &user_response));
+  EXPECT_FALSE(AuthorizeUser("/etc/shadow", opts, &user_response));
+
+  // Disallowed punctuation, spaces, and command injection characters.
+  EXPECT_FALSE(AuthorizeUser("user with spaces", opts, &user_response));
+  EXPECT_FALSE(AuthorizeUser("attacker;id", opts, &user_response));
+  EXPECT_FALSE(AuthorizeUser("user$name", opts, &user_response));
+  EXPECT_FALSE(AuthorizeUser("attacker|sh", opts, &user_response));
+  EXPECT_FALSE(AuthorizeUser("user`whoami`", opts, &user_response));
+  EXPECT_FALSE(AuthorizeUser("user\nadmin", opts, &user_response));
+
+  // Username starting with invalid characters.
+  EXPECT_FALSE(AuthorizeUser("-admin", opts, &user_response));
+  EXPECT_FALSE(AuthorizeUser("!user", opts, &user_response));
+
+  // Length limits: >32 characters.
+  string too_long_user(33, 'a');
+  EXPECT_FALSE(AuthorizeUser(too_long_user.c_str(), opts, &user_response));
+}
+
+TEST(AuthorizeUserTest, HandlesMdsFailureGracefully) {
+  struct AuthOptions opts = {};
+  opts.admin_policy_required = false;
+  opts.security_key = false;
+  opts.fingerprint = nullptr;
+  opts.fp_len = 0;
+  string user_response;
+
+  // With a valid username format, AuthorizeUser proceeds to MDS check.
+  // In an environment without metadata server, it must safely fail and return false without crashing.
+  EXPECT_FALSE(AuthorizeUser("testuser", opts, &user_response));
+  EXPECT_FALSE(AuthorizeUser("testuser", opts, &user_response, /*cloud_run=*/true));
+}
+
+TEST(AuthorizeUserTest, RejectsWhenAdminPolicyRequiredAndMdsUnavailable) {
+  struct AuthOptions opts = {};
+  opts.admin_policy_required = true;
+  opts.security_key = false;
+  opts.fingerprint = nullptr;
+  opts.fp_len = 0;
+  string user_response;
+
+  EXPECT_FALSE(AuthorizeUser("testadmin", opts, &user_response));
+}
+
+TEST(AuthorizeUserJourneyTest, ParseUserResponseToEmail) {
+  string valid_response =
+      "{\"loginProfiles\":[{\"name\":\"user@example.com\"}]}";
+  string email;
+  EXPECT_TRUE(ParseJsonToEmail(valid_response, &email));
+  EXPECT_EQ(email, "user@example.com");
+
+  // Missing name field in loginProfiles.
+  string missing_email = "{\"loginProfiles\":[{}]}";
+  email.clear();
+  EXPECT_FALSE(ParseJsonToEmail(missing_email, &email));
+
+  // Missing loginProfiles.
+  string missing_profiles = "{}";
+  email.clear();
+  EXPECT_FALSE(ParseJsonToEmail(missing_profiles, &email));
+
+  // Malformed JSON.
+  string malformed = "not-a-json";
+  email.clear();
+  EXPECT_FALSE(ParseJsonToEmail(malformed, &email));
+}
+
+TEST(AuthorizeUserJourneyTest, ParsePolicyResponseSuccessAndFailure) {
+  // Successful policy authorization.
+  string success_json = "{\"success\": true}";
+  EXPECT_TRUE(ParseJsonToSuccess(success_json));
+
+  // Denied policy authorization.
+  string denied_json = "{\"success\": false}";
+  EXPECT_FALSE(ParseJsonToSuccess(denied_json));
+
+  // Missing success field.
+  string empty_json = "{}";
+  EXPECT_FALSE(ParseJsonToSuccess(empty_json));
+
+  // Malformed JSON.
+  string malformed = "invalid json";
+  EXPECT_FALSE(ParseJsonToSuccess(malformed));
+}
+
+TEST(FileNameTest, ExtractsBasenameCorrectly) {
+  EXPECT_STREQ(FileName("/var/google-users.d/testuser"), "testuser");
+  EXPECT_STREQ(FileName("/var/google-sudoers.d/testadmin"), "testadmin");
+  EXPECT_STREQ(FileName("path/to/testuser"), "testuser");
+  EXPECT_STREQ(FileName("/testuser"), "testuser");
+  EXPECT_STREQ(FileName("testuser"), "testuser");
+  EXPECT_STREQ(FileName(""), "");
 }
 
 }  // namespace oslogin_utils

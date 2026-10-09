@@ -109,6 +109,12 @@ fi
 if [ -e /var/google-users.d ]; then
   restorecon -r /var/google-users.d
 fi
+if [ -e /etc/oslogin_passwd.cache.bin ]; then
+  restorecon /etc/oslogin_passwd.cache.bin
+fi
+if [ -e /etc/oslogin_group.cache ]; then
+  restorecon /etc/oslogin_group.cache
+fi
 
 %preun
 %systemd_preun google-oslogin-cache.timer

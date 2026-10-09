@@ -134,6 +134,14 @@ pam_sm_authenticate(pam_handle_t* pamh, int flags, int argc,
     return PAM_PERM_DENIED;
   }
 
+  // Fail closed if the server did not offer any challenges (for example, an
+  // unexpected AUTHENTICATED/UNSPECIFIED status on session start).
+  if (challenges.empty()) {
+    PAM_SYSLOG(pamh, LOG_ERR, "Start session response (status %s) contained "
+               "no challenges", status.c_str());
+    return PAM_PERM_DENIED;
+  }
+
   std::map<std::string,std::string> user_prompts;
   user_prompts[AUTHZEN] = "Google phone prompt";
   user_prompts[TOTP] = "Security code from Google Authenticator application";
@@ -232,7 +240,7 @@ pam_sm_authenticate(pam_handle_t* pamh, int flags, int argc,
 
   if (!ParseJsonToKey(response, "status", &status) || status != "AUTHENTICATED") {
     if (ParseJsonToKey(response, "rejectionReason", &status) && !status.empty()) {
-      pam_error(pamh, status.c_str());
+      pam_error(pamh, "%s", status.c_str());
     }
     return PAM_PERM_DENIED;
   }
